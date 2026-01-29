@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import os
 import ssl
 import sys
@@ -1164,6 +1165,47 @@ class HTTPHandler:
             return getattr(litellm, "sync_transport", None)
 
 
+def _build_params_key_name(params: Optional[dict]) -> str:
+    _params_key_name = ""
+    if params is not None:
+        for key, value in params.items():
+            try:
+                _params_key_name += f"{key}_{value}"
+            except Exception:
+                pass
+    return _params_key_name
+
+
+def _build_async_httpx_cache_key(
+    llm_provider: Union[LlmProviders, httpxSpecialProvider],
+    params: Optional[dict],
+) -> str:
+    return "async_httpx_client" + _build_params_key_name(params) + llm_provider
+
+
+def _build_httpx_cache_key(params: Optional[dict]) -> str:
+    return "httpx_client" + _build_params_key_name(params)
+
+
+def _get_llm_client_cache():
+    # Lazily initialize the global in-memory client cache to avoid relying on
+    # litellm globals being fully populated during import time.
+    cache = getattr(litellm, "in_memory_llm_clients_cache", None)
+    if cache is None:
+        from litellm.caching.llm_caching_handler import LLMClientCache
+
+        cache = LLMClientCache()
+        setattr(litellm, "in_memory_llm_clients_cache", cache)
+    return cache
+
+
+def _apply_event_loop_cache_key(cache, key: str) -> str:
+    try:
+        return cache.update_cache_key_with_event_loop(key)
+    except Exception:
+        return key
+
+
 def get_async_httpx_client(
     llm_provider: Union[LlmProviders, httpxSpecialProvider],
     params: Optional[dict] = None,
@@ -1175,24 +1217,10 @@ def get_async_httpx_client(
 
     Caches the new client and returns it.
     """
-    _params_key_name = ""
-    if params is not None:
-        for key, value in params.items():
-            try:
-                _params_key_name += f"{key}_{value}"
-            except Exception:
-                pass
-
-    _cache_key_name = "async_httpx_client" + _params_key_name + llm_provider
-
-    # Lazily initialize the global in-memory client cache to avoid relying on
-    # litellm globals being fully populated during import time.
-    cache = getattr(litellm, "in_memory_llm_clients_cache", None)
-    if cache is None:
-        from litellm.caching.llm_caching_handler import LLMClientCache
-
-        cache = LLMClientCache()
-        setattr(litellm, "in_memory_llm_clients_cache", cache)
+    _cache_key_name = _build_async_httpx_cache_key(
+        llm_provider=llm_provider, params=params
+    )
+    cache = _get_llm_client_cache()
 
     _cached_client = cache.get_cache(_cache_key_name)
     if _cached_client:
@@ -1224,24 +1252,8 @@ def _get_httpx_client(params: Optional[dict] = None) -> HTTPHandler:
 
     Caches the new client and returns it.
     """
-    _params_key_name = ""
-    if params is not None:
-        for key, value in params.items():
-            try:
-                _params_key_name += f"{key}_{value}"
-            except Exception:
-                pass
-
-    _cache_key_name = "httpx_client" + _params_key_name
-
-    # Lazily initialize the global in-memory client cache to avoid relying on
-    # litellm globals being fully populated during import time.
-    cache = getattr(litellm, "in_memory_llm_clients_cache", None)
-    if cache is None:
-        from litellm.caching.llm_caching_handler import LLMClientCache
-
-        cache = LLMClientCache()
-        setattr(litellm, "in_memory_llm_clients_cache", cache)
+    _cache_key_name = _build_httpx_cache_key(params=params)
+    cache = _get_llm_client_cache()
 
     _cached_client = cache.get_cache(_cache_key_name)
     if _cached_client:
@@ -1260,3 +1272,33 @@ def _get_httpx_client(params: Optional[dict] = None) -> HTTPHandler:
         ttl=_DEFAULT_TTL_FOR_HTTPX_CLIENTS,
     )
     return _new_client
+
+
+async def force_close_cached_async_httpx_client(
+    llm_provider: Union[LlmProviders, httpxSpecialProvider],
+    params: Optional[dict] = None,
+    trigger_gc: bool = True,
+) -> Optional[AsyncHTTPHandler]:
+    """
+    Force-close a cached AsyncHTTPHandler and remove it from cache.
+
+    This mirrors the GC-driven cleanup path where the handler is evicted
+    and its __del__ closes the underlying httpx.AsyncClient.
+    """
+    cache = _get_llm_client_cache()
+    cache_key = _build_async_httpx_cache_key(
+        llm_provider=llm_provider, params=params
+    )
+    cached_handler = cache.get_cache(cache_key)
+    if cached_handler is None:
+        return None
+
+    cache.delete_cache(_apply_event_loop_cache_key(cache, cache_key))
+
+    if isinstance(cached_handler, AsyncHTTPHandler):
+        await cached_handler.close()
+
+    if trigger_gc:
+        gc.collect()
+
+    return cached_handler

@@ -1,3 +1,4 @@
+import os
 import time
 import types
 from typing import (
@@ -37,6 +38,8 @@ from litellm.litellm_core_utils.logging_utils import track_llm_api_timing
 from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
 from litellm.llms.base_llm.chat.transformation import BaseConfig, BaseLLMException
 from litellm.llms.bedrock.chat.invoke_handler import MockResponseIterator
+from litellm.llms.custom_httpx.http_handler import force_close_cached_async_httpx_client
+from litellm.secret_managers.main import str_to_bool
 from litellm.types.utils import (
     EmbeddingResponse,
     ImageResponse,
@@ -433,6 +436,14 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
         """
         start_time = time.time()
         try:
+            if str_to_bool(
+                os.getenv("LITELLM_DEBUG_FORCE_HTTPX_CLIENT_GC", "False")
+            ):
+                await force_close_cached_async_httpx_client(
+                    llm_provider=LlmProviders.OPENAI,
+                    params=BaseOpenAILLM._get_async_httpx_client_params(),
+                    trigger_gc=True,
+                )
             raw_response = (
                 await openai_aclient.chat.completions.with_raw_response.create(
                     **data, timeout=timeout
