@@ -114,6 +114,13 @@ class BaseOpenAILLM:
     """
 
     @staticmethod
+    def _get_async_httpx_client_params() -> Dict[str, Any]:
+        ssl_config = get_ssl_configuration()
+        params = {"ssl_verify": ssl_config} if ssl_config is not None else {}
+        params["disable_aiohttp_transport"] = litellm.disable_aiohttp_transport
+        return params
+
+    @staticmethod
     def get_cached_openai_client(
         client_initialization_params: dict, client_type: Literal["openai", "azure"]
     ) -> Optional[Union[OpenAI, AsyncOpenAI, AzureOpenAI, AsyncAzureOpenAI]]:
@@ -210,10 +217,7 @@ class BaseOpenAILLM:
         from litellm.llms.custom_httpx.http_handler import get_async_httpx_client
 
         try:
-            # Get SSL config and include in params for proper cache key
-            ssl_config = get_ssl_configuration()
-            params = {"ssl_verify": ssl_config} if ssl_config is not None else {}
-            params["disable_aiohttp_transport"] = litellm.disable_aiohttp_transport
+            params = BaseOpenAILLM._get_async_httpx_client_params()
 
             # Get a cached AsyncHTTPHandler which manages the httpx.AsyncClient
             cached_handler = get_async_httpx_client(
@@ -221,6 +225,11 @@ class BaseOpenAILLM:
                 params=params,  # Include SSL config in cache key
                 shared_session=shared_session,
             )
+            try:
+                # Ensure the handler is kept alive while the httpx client is in use.
+                setattr(cached_handler.client, "_litellm_http_handler", cached_handler)
+            except Exception:
+                pass
             # Return the underlying httpx client from the handler
             return cached_handler.client
         except (ImportError, AttributeError, KeyError) as e:
@@ -257,6 +266,11 @@ class BaseOpenAILLM:
 
             # Get a cached HTTPHandler which manages the httpx.Client
             cached_handler = _get_httpx_client(params=params)
+            try:
+                # Ensure the handler is kept alive while the httpx client is in use.
+                setattr(cached_handler.client, "_litellm_http_handler", cached_handler)
+            except Exception:
+                pass
             # Return the underlying httpx client from the handler
             return cached_handler.client
         except (ImportError, AttributeError, KeyError) as e:
